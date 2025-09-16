@@ -7,6 +7,8 @@
 """
 import os
 import uuid
+from azure.cognitiveservices.vision.computervision import ComputerVisionClient
+from msrest.authentication import CognitiveServicesCredentials
 
 try:
     from urlparse import urlparse, urljoin
@@ -23,6 +25,24 @@ from albumy.extensions import db
 from albumy.models import User
 from albumy.settings import Operations
 
+AZURE_CV_KEY = os.getenv('AZURE_CV_KEY')
+AZURE_CV_ENDPOINT = os.getenv('AZURE_CV_ENDPOINT')
+
+computervision_client = ComputerVisionClient(
+    AZURE_CV_ENDPOINT, CognitiveServicesCredentials(AZURE_CV_KEY)
+)
+
+def generate_alt_text(image_path):
+    with open(image_path, "rb") as image_stream:
+        description_result = computervision_client.describe_image_in_stream(image_stream)
+    if description_result.captions:
+        return description_result.captions[0].text
+    return "No description available."
+
+def detect_objects(image_path):
+    with open(image_path, "rb") as image_stream:
+        tags_result = computervision_client.tag_image_in_stream(image_stream)
+    return [tag.name for tag in tags_result.tags]
 
 def generate_token(user, operation, expire_in=None, **kwargs):
     s = Serializer(current_app.config['SECRET_KEY'], expire_in)

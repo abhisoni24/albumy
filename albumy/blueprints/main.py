@@ -11,13 +11,13 @@ from flask import render_template, flash, redirect, url_for, current_app, \
     send_from_directory, request, abort, Blueprint
 from flask_login import login_required, current_user
 from sqlalchemy.sql.expression import func
-
+from sqlalchemy import or_
 from albumy.decorators import confirm_required, permission_required
 from albumy.extensions import db
 from albumy.forms.main import DescriptionForm, TagForm, CommentForm
 from albumy.models import User, Photo, Tag, Follow, Collect, Comment, Notification
 from albumy.notifications import push_comment_notification, push_collect_notification
-from albumy.utils import rename_image, resize_image, redirect_back, flash_errors
+from albumy.utils import rename_image, resize_image, redirect_back, flash_errors, generate_alt_text, detect_objects
 
 main_bp = Blueprint('main', __name__)
 
@@ -57,11 +57,23 @@ def search():
     page = request.args.get('page', 1, type=int)
     per_page = current_app.config['ALBUMY_SEARCH_RESULT_PER_PAGE']
     if category == 'user':
-        pagination = User.query.whooshee_search(q).paginate(page, per_page)
+        pagination = User.query.filter(
+            or_(
+                User.username.ilike(f'%{q}%'),
+                User.name.ilike(f'%{q}%')
+            )
+        ).paginate(page=page, per_page=per_page)
     elif category == 'tag':
-        pagination = Tag.query.whooshee_search(q).paginate(page, per_page)
+        pagination = Tag.query.filter(
+            Tag.name.ilike(f'%{q}%')
+        ).paginate(page=page, per_page=per_page)
     else:
-        pagination = Photo.query.whooshee_search(q).paginate(page, per_page)
+        pagination = Photo.query.filter(
+            or_(
+                Photo.description.ilike(f'%{q}%'),
+                Photo.tags.any(Tag.name.ilike(f'%{q}%'))
+            )
+        ).paginate(page=page, per_page=per_page)
     results = pagination.items
     return render_template('main/search.html', q=q, results=results, pagination=pagination, category=category)
 
@@ -122,23 +134,66 @@ def upload():
     if request.method == 'POST' and 'file' in request.files:
         f = request.files.get('file')
         filename = rename_image(f.filename)
-        f.save(os.path.join(current_app.config['ALBUMY_UPLOAD_PATH'], filename))
+        file_path = os.path.join(current_app.config['ALBUMY_UPLOAD_PATH'], filename)
+        f.save(file_path)
         filename_s = resize_image(f, filename, current_app.config['ALBUMY_PHOTO_SIZE']['small'])
         filename_m = resize_image(f, filename, current_app.config['ALBUMY_PHOTO_SIZE']['medium'])
+
+        # Get description from form or generate alt text
+        description = request.form.get('description')
+        if not description:
+            description = generate_alt_text(file_path)
+
         photo = Photo(
             filename=filename,
             filename_s=filename_s,
             filename_m=filename_m,
-            author=current_user._get_current_object()
+            author=current_user._get_current_object(),
+            description=description
         )
         db.session.add(photo)
         db.session.commit()
+
+        # Detect objects and add as tags
+        objects = detect_objects(file_path)
+        for obj in objects:
+            tag = Tag.query.filter_by(name=obj).first()
+            if not tag:
+                tag = Tag(name=obj)
+                db.session.add(tag)
+                db.session.commit()
+            if tag not in photo.tags:
+                photo.tags.append(tag)
+        db.session.commit()
+
+        flash('Photo uploaded.', 'success')
+        return redirect(url_for('main.index'))
     return render_template('main/upload.html')
 
 
 @main_bp.route('/photo/<int:photo_id>')
 def show_photo(photo_id):
     photo = Photo.query.get_or_404(photo_id)
+
+    # Calling Azure Vision APIs if description or tags are missing
+    updated = False
+    if not photo.description:
+        photo.description = generate_alt_text(os.path.join(current_app.config['ALBUMY_UPLOAD_PATH'], photo.filename))
+        updated = True
+    if not photo.tags or len(photo.tags) == 0:
+        objects = detect_objects(os.path.join(current_app.config['ALBUMY_UPLOAD_PATH'], photo.filename))
+        for obj in objects:
+            tag = Tag.query.filter_by(name=obj).first()
+            if not tag:
+                tag = Tag(name=obj)
+                db.session.add(tag)
+                db.session.commit()
+            if tag not in photo.tags:
+                photo.tags.append(tag)
+                updated = True
+    if updated:
+        db.session.commit()
+
     page = request.args.get('page', 1, type=int)
     per_page = current_app.config['ALBUMY_COMMENT_PER_PAGE']
     pagination = Comment.query.with_parent(photo).order_by(Comment.timestamp.asc()).paginate(page, per_page)

@@ -1,0 +1,4 @@
+FLASK_APP=albumy
+FLASK_ENV=development
+AZURE_CV_KEY=
+AZURE_CV_ENDPOINT=
